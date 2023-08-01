@@ -35,7 +35,6 @@
 
 // Map that ties commandID to a promise that needs resolving
 #include <unordered_map>
-// std::unordered_map<std::string, Napi::Promise::Deferred> commandPromises;
 std::unordered_map<std::string, std::shared_ptr<Napi::Promise::Deferred>> commandPromises;
 std::mutex commandPromisesMutex;
 // ------
@@ -60,6 +59,9 @@ std::string GenerateUniqueCommandId(std::string command)
     return command + "_" + str;
 }
 
+// Asynchronous poller(Busy waiting with inefficiency reducer system sleep)
+// Every second the poller polls the mutexed(mutual exclusion) resource that marks down a completed command which has a promise waiting.
+// Once the Execute method has polled a successful command it will move on to the OnOK function to use the necessary node enviroment reference to resolve the promise from a mutexed list of commandId - deferred(promise)
 class CommandCompletionPoller : public Napi::AsyncWorker
 {
 public:
@@ -68,7 +70,6 @@ public:
 
     void Execute()
     {
-        std::cout << "Started polling worker" << std::endl;
         while (true)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // polling interval
@@ -101,9 +102,11 @@ private:
     Napi::Env env_;
 };
 
+// MyDeviceManagerEvents is defined in the COM server EXE that is registered to the system registry. The blueprints for the com server come from the i.c and i.h file. These are events that are called by the COM server.
 class CMyDeviceManagerEvents : public IMyDeviceManagerEvents
 {
 public:
+    // OnDataEvent which is sent by the scanner sink on the server
     STDMETHODIMP OnDataEvent(BSTR data)
     {
         std::wcout << std::endl;
@@ -112,6 +115,7 @@ public:
         return S_OK;
     }
 
+    // OnCommandComplete is sent each time a DoCommand command has been completed.
     STDMETHODIMP OnCommandCompleted(BSTR commandId)
     {
         std::wcout << std::endl;
@@ -126,6 +130,7 @@ public:
         return S_OK;
     }
 
+    // Not yet implemented
     STDMETHODIMP OnErrorEvent(BSTR errorMessage)
     {
         std::wstring wstrErrorMessage(errorMessage);
@@ -154,6 +159,8 @@ public:
     }
 };
 
+// Long lived process to set up a connection to the 32 bit opos COM server
+// Requires the correct interface from the Opos server for connection points which this client connects to for event handling.
 void comThreadFunction()
 {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -181,12 +188,6 @@ void comThreadFunction()
     // Advise the connection point with the event handler object
     DWORD dwCookie;
     hr = spCP->Advise(&eventHandler, &dwCookie);
-
-    // Call a method of your COM server, e.g., StartScanner
-    // BSTR commandId = SysAllocString(L"startScanner");
-
-    // hr = spDeviceManager->StartScanner(commandId);
-    // SysFreeString(commandId);
 
     // Run a loop to handle COM events and user commands
     MSG msg;
@@ -260,6 +261,8 @@ void comThreadFunction()
     CoUninitialize();
 }
 
+// Currently has been used as a failsafe against broken javascript calls to manipulate the scanner and to end the execution of the client
+// A thread that waits for user input
 void inputThreadFunction()
 {
     std::string input;
@@ -282,11 +285,17 @@ void inputThreadFunction()
     }
 }
 
+// DoCommand is called from JavaScript code. It accepts a string as a command.
+// Each command received will be added to the promise list as a unique commandId and deffered(promise) pair.
+// The deffered object has been made into a shared_ptr because of the lack of a default constructor for the Deffered napi object. This makes Cpp angry and won't let a typed pair with a Deffered napi object to exist.
+// The command and commandId will be paired to be used in com server calls. The com server requires a commandId to notify the client via onCommandComplete that that command with a certain commandId has finished.
+// Each call to DoCommand also starts a poller. Maximum amount of workers at once by default is 4. If there are too many requests to create pollers then pollers will be added to a queue which will start them
+// once resources are available.
 Napi::Promise DoCommand(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
     std::string command = info[0].ToString().Utf8Value();
-    std::string commandId = GenerateUniqueCommandId(command); // You'll need to implement this function
+    std::string commandId = GenerateUniqueCommandId(command);
 
     std::shared_ptr<Napi::Promise::Deferred> deferred = std::make_shared<Napi::Promise::Deferred>(Napi::Promise::Deferred::New(env));
 
@@ -306,23 +315,10 @@ Napi::Promise DoCommand(const Napi::CallbackInfo &info)
     worker->Queue();
 
     return deferred->Promise();
-
-    /*     std::lock_guard<std::mutex> lock(commandQueueMutex);
-        commandQueue.push(command); */
 }
 
-int mainy()
-{
-    std::thread comThread(comThreadFunction);
-    std::thread inputThread(inputThreadFunction);
-
-    comThread.join();
-    inputThread.join();
-
-    std::cout << "Done." << std::endl;
-    return 0;
-}
-
+// Starts a thread to start a connection to the 32 bit COM server and starts optional test based user input thread.
+// Threads are detached to not block the node main thread. This is sensible since comThread is a very long lived process.
 Napi::Promise StartMain(const Napi::CallbackInfo &info)
 {
     Napi::Env env = info.Env();
@@ -346,6 +342,7 @@ Napi::Promise StartMain(const Napi::CallbackInfo &info)
     return deferred.Promise();
 }
 
+// Mapping of JavaScript functions to Cpp functions. Each Napi String will be called from javascript as addon.startMain() etc...
 Napi::Object Init(Napi::Env env, Napi::Object exports)
 {
     exports.Set(Napi::String::New(env, "startMain"),
